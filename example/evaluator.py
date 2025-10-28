@@ -19,8 +19,8 @@ class CartPoleEvaluator:
             render_mode="human",
         )
         self.agent = CartPoleAgent()
-        self.agent.train()
-        self.agent.save_model("model.pt")
+        self.agent.load_model("model.pt")
+        # self.agent.train()
 
     def select_action(self, state: np.ndarray) -> int:
         return int(
