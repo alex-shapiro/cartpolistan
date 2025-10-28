@@ -4,9 +4,14 @@ import numpy as np
 
 class CartPoleEvaluator:
     def __init__(self):
-        self.eval_env: gym.Env[np.ndarray, int] = gym.make(
+        self.headless_env: gym.Env[np.ndarray, int] = gym.make(
             "CartPole-v1",
             max_episode_steps=5000,
+        )
+        self.rendered_env: gym.Env[np.ndarray, int] = gym.make(
+            "CartPole-v1",
+            max_episode_steps=5000,
+            render_mode="human",
         )
 
     def select_action(self, state: np.ndarray) -> int:
@@ -18,15 +23,15 @@ class CartPoleEvaluator:
     def evaluate(self, n_episodes: int = 10):
         n_parameters = self.num_parameters()
         print(f"agent parameters: {n_parameters}")
-        self.eval_env.reset()
         rewards: list[float] = []
         for i in range(n_episodes):
-            state, _ = self.eval_env.reset()
+            env = self.rendered_env if i == n_episodes - 1 else self.headless_env
+            state, _ = env.reset()
             ended = False
             episode_reward = 0.0
             while not ended:
                 action = self.select_action(state)
-                state, reward, done, terminated, _ = self.eval_env.step(action)
+                state, reward, done, terminated, _ = env.step(action)
                 ended = done or terminated
                 episode_reward += float(reward)
             rewards.append(episode_reward)
