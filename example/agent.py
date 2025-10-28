@@ -161,6 +161,28 @@ class CartPoleAgent:
     def value_loss(self, batch: "TrajectoryTorchBatch") -> Tensor:
         return ((self.actor_critic.v(batch.states) - batch.returns) ** 2).mean()
 
+    def save_model(self, path: str):
+        """Save the trained model and optimizer states to disk"""
+        torch.save(
+            {
+                "actor_critic_state_dict": self.actor_critic.state_dict(),
+                "policy_optimizer_state_dict": self.policy_optimizer.state_dict(),
+                "value_optimizer_state_dict": self.value_optimizer.state_dict(),
+                "seed": self.seed,
+            },
+            path,
+        )
+        print(f"Model saved to {path}")
+
+    def load_model(self, path: str):
+        """Load a trained model and optimizer states from disk"""
+        checkpoint = torch.load(path, weights_only=True)
+        self.actor_critic.load_state_dict(checkpoint["actor_critic_state_dict"])
+        self.policy_optimizer.load_state_dict(checkpoint["policy_optimizer_state_dict"])
+        self.value_optimizer.load_state_dict(checkpoint["value_optimizer_state_dict"])
+        self.seed = checkpoint["seed"]
+        print(f"Model loaded from {path}")
+
 
 @final
 class CategoricalActor(nn.Module):
