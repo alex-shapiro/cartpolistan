@@ -1,3 +1,4 @@
+from .agent import CartPoleAgent
 import gymnasium as gym
 import numpy as np
 import eval_env
@@ -14,22 +15,21 @@ class CartPoleEvaluator:
             max_episode_steps=5000,
             render_mode="human",
         )
-        # TODO: init your agent here
+        self.agent = CartPoleAgent()
+        self.agent.train()
 
     def select_action(self, state: np.ndarray) -> int:
-        # TODO: implement me!
-        raise NotImplementedError
+        return self.agent.epsilon_greedy_action(state, eps=0, q_net=self.agent.q_net)
 
     def num_parameters(self) -> int:
-        # TODO: implement me!
-        raise NotImplementedError
+        return sum([np.prod(p.shape) for p in self.agent.q_net.parameters()])
 
     def evaluate(self, n_episodes: int = 10):
         n_parameters = self.num_parameters()
         print(f"agent parameters: {n_parameters}")
         rewards: list[float] = []
         for i in range(n_episodes):
-            env = self.rendered_env
+            env = self.rendered_env  # if i == n_episodes - 1 else self.headless_env
             state, _ = env.reset()
             ended = False
             episode_reward = 0.0
