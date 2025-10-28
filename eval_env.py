@@ -1,11 +1,10 @@
 import math
 
 import gymnasium as gym
-from gymnasium import spaces
-from gymnasium.envs.classic_control import CartPoleEnv
-
 import numpy as np
 import pygame
+from gymnasium import spaces
+from gymnasium.envs.classic_control import CartPoleEnv
 from pygame import gfxdraw
 
 

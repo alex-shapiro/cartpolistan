@@ -1,257 +1,408 @@
-import time
-import warnings
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import final, override
+import typing
+from dataclasses import dataclass
+from typing import final
 
 import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium.spaces import Box, Discrete
-from gymnasium.wrappers import RecordVideo
-from numpy import ndarray
 from torch import Tensor, nn
-from torch.optim import Adam
+from torch.distributions import Categorical
+from torch.optim import AdamW
 
-from .replay_buffer import ReplayBuffer
+import eval_env
 
 
 @final
 class CartPoleAgent:
-    def __init__(self, seed: int = 2023):
-        # simulation environment
-        self.env: gym.Env[ndarray, int] = gym.make("CartPoleCustom-v0")  # pyright: ignore[reportUnknownMemberType]
-        self.eval_env: gym.Env[ndarray, int] = gym.make(  # pyright: ignore[reportUnknownMemberType]
-            "CartPoleCustom-v0"
-        )
+    def __init__(
+        self,
+        seed: int = 1000,
+        steps_per_epoch: int = 4000,
+        epochs: int = 120,
+        gamma: float = 0.99,
+        clip_ratio: float = 0.2,
+        pi_lr: float = 1e-3,
+        value_lr: float = 1e-2,
+        train_policy_iters: int = 80,
+        train_value_iters: int = 80,
+        lamda: float = 0.97,
+        max_episode_length: int = 1000,
+        target_kl: float = 0.05,
+    ):
+        super().__init__()
 
-        self.state_space: Box = self.env.observation_space  # pyright: ignore[reportAttributeAccessIssue]
-        self.action_space: Discrete = self.env.action_space  # pyright: ignore[reportAttributeAccessIssue]
+        env_name = "CartPoleCustom-v0"
 
-        # initialize random seeds
+        self.env: gym.Env[np.ndarray, int] = gym.make(env_name)  # pyright: ignore[reportUnknownMemberType]
+        state_space: Box = self.env.observation_space  # pyright: ignore[reportAssignmentType]
+        action_space: Discrete = self.env.action_space  # pyright: ignore[reportAssignmentType]
+
+        # RNG seeds
         np.random.seed(seed)
         torch.manual_seed(seed)  # pyright: ignore[reportUnknownMemberType, reportUnusedCallResult]
         self.env.action_space.seed(seed)  # pyright: ignore[reportUnusedCallResult]
         self.seed = seed
 
-        # replay buffer
-        self.replay_buffer = ReplayBuffer(
-            capacity=200_000,
-            state_space=self.state_space,
-            action_space=self.action_space,
+        # trajectory buffer
+        self.trajectories = TrajectoryBuffer(
+            capacity=steps_per_epoch,
+            state_shape=list(state_space.shape),
+            action_shape=[1],
+            gamma=gamma,
+            lamda=lamda,
         )
 
-        # exploration hyperparameters
-        self.num_steps = 160_000
-        self.eps_initial = 1.0
-        self.eps_final = 0.02
-        self.exploration_fraction = 0.05
-
-        # other hyperparameters
-        self.discount_factor = 0.99
-        self.learning_rate = 1e-4
-        self.batch_size = 64
+        # hyperparameters
+        self.steps_per_epoch = steps_per_epoch
+        self.epochs = epochs
+        self.gamma = gamma
+        self.clip_ratio = clip_ratio
+        self.train_policy_iters = train_policy_iters
+        self.train_value_iters = train_value_iters
+        self.lamda = lamda
+        self.max_episode_length = max_episode_length
+        self.target_kl = target_kl
 
         # models
-        self.state_size = self.state_space.shape[0]
-        self.action_size = int(self.action_space.n)
-        self.perf_timers = PerfTimers()
+        self.actor_critic = ActorCritic(
+            state_space=state_space,
+            action_space=action_space,
+        )
+        self.policy_optimizer = AdamW(self.actor_critic.pi.parameters(), lr=pi_lr)
+        self.value_optimizer = AdamW(self.actor_critic.v.parameters(), lr=value_lr)
 
-        self.device = torch.device("cpu")
-        self.q_net = QNetwork(self.state_size, self.action_size).to(self.device)
-        self.target_net = QNetwork(self.state_size, self.action_size).to(self.device)
-        self.optimizer = Adam(self.q_net.parameters(), lr=self.learning_rate)
-        self.criterion = nn.MSELoss()
+    def train(self):
+        for epoch in range(1, self.epochs + 1):
+            print(f"\nEpoch {epoch}")
+            state, _ = self.env.reset()
 
-    def train(
-        self,
-        model_update_interval: int = 5,
-        target_update_interval: int = 1000,
-        eval_interval: int = 10000,
-        num_eval_episodes: int = 100,
-    ):
-        state, _ = self.env.reset(seed=self.seed)
+            for t in range(self.steps_per_epoch):
+                action, logp_action, value = self.actor_critic.step(
+                    torch.as_tensor(state, dtype=torch.float32)
+                )
+                next_state, reward, done, truncated, _ = self.env.step(action)
 
-        for step in range(1, self.num_steps + 1):
-            start = time.perf_counter()
-            eps = self.exploration_rate(step)
-            state = self.step(state, eps)
+                self.trajectories.push(
+                    state=state,
+                    action=action,
+                    logp=float(logp_action),
+                    value=float(value),
+                    reward=float(reward),
+                )
 
-            if step % target_update_interval == 0:
-                _ = self.target_net.load_state_dict(self.q_net.state_dict())
+                state = next_state
+                if done or truncated or (t == self.steps_per_epoch - 1):
+                    _, _, value = self.actor_critic.step(
+                        torch.as_tensor(state, dtype=torch.float32)
+                    )
+                    is_truncated = truncated or t == self.steps_per_epoch - 1
+                    self.trajectories.push_episode_end(value, is_truncated=is_truncated)
+                    state, _ = self.env.reset()
 
-            if step % model_update_interval == 0 and step > 1000:
-                self.replay()
+            self.update()
 
-            self.perf_timers.overall.append(time.perf_counter() - start)
+    def update(self):
+        batch = self.trajectories.get_batch().as_torch()
 
-            if step % eval_interval == 0:
-                episode_rewards = self.eval(n_episodes=num_eval_episodes)
-                r_mean = np.mean(episode_rewards)
-                r_std = np.std(episode_rewards)
-                print()
-                print(f"Evaluation at step {step}:")
-                print(f"- eps: {eps:.2f}")
-                print(f"- reward: {r_mean:.2f} +/- {r_std:.2f}")
-                state, _ = self.env.reset()
+        policy_loss_old, _ = self.policy_loss(batch)
+        value_loss_old = self.value_loss(batch)
 
-    def step(self, state: ndarray, eps: float) -> ndarray:
-        """Runs the next step and returns the resulting state"""
-        start = time.perf_counter()
-        action = self.epsilon_greedy_action(state, eps, self.q_net)
-        next_state, reward, terminated, truncated, _info = self.env.step(action)
-        self.replay_buffer.push(
-            state=state,
-            next_state=next_state,
-            action=action,
-            reward=float(reward),
-            terminated=(terminated or truncated),
+        # train policy net
+        for i in range(self.train_policy_iters):
+            self.policy_optimizer.zero_grad()
+            policy_loss, policy_info = self.policy_loss(batch)
+            if policy_info.approximate_kl > 1.5 * self.target_kl:
+                print(f"early stopping at step {i} due to reaching max KL")
+                break
+            policy_loss.backward()  # pyright: ignore[reportUnknownMemberType]
+            self.policy_optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+
+        # train value net
+        for i in range(self.train_value_iters):
+            self.value_optimizer.zero_grad()
+            value_loss = self.value_loss(batch)
+            value_loss.backward()  # pyright: ignore[reportUnknownMemberType]
+            self.value_optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+
+        print("Losses:")
+        print(f"Policy Loss: {policy_loss_old.item():.4f} → {policy_loss.item():.4f}")
+        print(f"Value Loss: {value_loss_old.item():.4f} → {value_loss.item():.4f}")
+
+    def policy_loss(self, batch: "TrajectoryTorchBatch") -> tuple[Tensor, "PolicyInfo"]:
+        # policy loss
+        pi: Categorical
+        logps: Tensor
+        pi, logps = self.actor_critic.pi(batch.states, batch.actions)  # pyright: ignore[reportAny]
+        ratio = torch.exp(logps - batch.logps)
+        min = 1 - self.clip_ratio
+        max = 1 + self.clip_ratio
+        clipped_adv = torch.clamp(ratio, min, max) * batch.advantages
+        unclipped = ratio * batch.advantages
+        policy_loss = -torch.min(unclipped, clipped_adv).mean()
+
+        # additional policy info
+        approximate_kl = (batch.logps - logps).mean().item()
+        mean_entropy = pi.entropy().mean().item()
+        clipped_fraction = (
+            (ratio.gt(1 + self.clip_ratio) | ratio.lt(1 - self.clip_ratio))
+            .to(torch.float32)
+            .mean()
+            .item()
+        )
+        policy_info = PolicyInfo(
+            approximate_kl=approximate_kl,
+            mean_entropy=mean_entropy,
+            clipped_fraction=clipped_fraction,
         )
 
-        # reset the env if the episode has ended
-        if terminated or truncated:
-            next_state, _ = self.env.reset()
+        return policy_loss, policy_info
 
-        self.perf_timers.step.append(time.perf_counter() - start)
-        return next_state
-
-    def epsilon_greedy_action(
-        self,
-        state: ndarray,
-        eps: float,
-        q_net: "QNetwork",
-    ) -> int:
-        start = time.perf_counter()
-        if np.random.rand() <= eps:
-            action = int(self.action_space.sample())
-        else:
-            with torch.no_grad():
-                state_tensor = torch.as_tensor(state, device=self.device).unsqueeze(0)
-                q_values: Tensor = q_net(state_tensor)  # pyright: ignore[reportAny]
-                action = int(q_values.argmax().item())
-        self.perf_timers.eps_greedy_action.append(time.perf_counter() - start)
-        return action
-
-    def replay(self):
-        start = time.perf_counter()
-
-        # fetch N random samples from the replay buffer
-        batch = self.replay_buffer.sample(self.batch_size).to_torch(self.device)
-
-        # Predict max Q values across all possible actions in the next state
-        # Bootstrap iff the state is nonterminal; otherwise td_target is just the reward
-        with torch.no_grad():
-            next_q_values: Tensor = self.target_net(batch.next_states)  # pyright: ignore[reportAny]
-            next_q_values, _ = next_q_values.max(dim=1)
-            should_bootstrap = batch.terminateds.logical_not()
-            td_target = (
-                batch.rewards + self.discount_factor * next_q_values * should_bootstrap
-            )
-
-        # Predict Q values for all possible actions in a state
-        # Then take ("gather") just the Q value for the selected action
-        current_q_values: Tensor = self.q_net(batch.states)  # pyright: ignore[reportAny]
-        current_q_values = current_q_values.gather(1, batch.actions)
-        current_q_values = current_q_values.squeeze(dim=-1)
-
-        # sanity check
-        assert current_q_values.shape == (self.batch_size,)
-        assert current_q_values.shape == td_target.shape
-
-        # Compute MSE loss & backprop
-        loss = ((current_q_values - td_target) ** 2).mean()
-        self.optimizer.zero_grad()
-        loss.backward()  # pyright: ignore [reportUnknownMemberType, reportUnusedCallResult]
-        self.optimizer.step()  # pyright: ignore[reportUnknownMemberType, reportUnusedCallResult]
-        self.perf_timers.replay.append(time.perf_counter() - start)
-
-    def eval(
-        self, n_episodes: int, eps: float = 0.0, video_name: str | None = None
-    ) -> list[float]:
-        """Evaluates the model"""
-        episode_rewards: list[float] = []
-
-        video_path = None
-        if video_name is None:
-            eval_env = self.eval_env
-        else:
-            video_path = Path(__file__).parent / "logs" / "videos" / video_name
-            video_path.parent.mkdir(parents=True, exist_ok=True)
-            warnings.filterwarnings(
-                "ignore", category=UserWarning, module="gymnasium.wrappers.rendering"
-            )
-            eval_env = RecordVideo(  # pyright: ignore[reportUnknownVariableType]
-                self.eval_env,
-                str(video_path.parent),
-                step_trigger=lambda _: False,
-                video_length=100_000,
-            )
-            eval_env.start_recording(video_name)
-
-        for _ in range(n_episodes):
-            total_reward = 0.0
-            state, _ = eval_env.reset()
-            done = False
-            while not done:
-                action = self.epsilon_greedy_action(state, eps, self.q_net)
-                state, reward, terminated, truncated, _info = eval_env.step(action)
-                total_reward += float(reward)
-                done = terminated or truncated
-            episode_rewards.append(total_reward)
-
-        if video_path is not None:
-            eval_env.close()
-
-        return episode_rewards
-
-    def exploration_rate(self, step: int) -> float:
-        """Returns the current value of the exploration rate according to a linear schedule"""
-        explore_steps = self.num_steps * self.exploration_fraction
-        progress = min(step / explore_steps, 1.0)
-        return self.eps_initial + progress * (self.eps_final - self.eps_initial)
+    def value_loss(self, batch: "TrajectoryTorchBatch") -> Tensor:
+        return ((self.actor_critic.v(batch.states) - batch.returns) ** 2).mean()
 
 
 @final
-class QNetwork(nn.Module):
-    """
-    NN for Q-Value prediction
-    Has 3 fully connected layers separated by ReLU activations
-    """
+class CategoricalActor(nn.Module):
+    """Policy prediction over discrete 1D action spaces"""
 
-    def __init__(self, state_size: int, action_size: int, hidden_size: int = 64):
-        super(QNetwork, self).__init__()  # pyright: ignore[reportUnknownMemberType]
-        self.net = nn.Sequential(
-            nn.Linear(state_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, action_size),
+    def __init__(
+        self,
+        d_state: int,
+        d_hidden: int,
+        d_action: int,
+        activation: nn.Module,
+    ):
+        super().__init__()  # pyright: ignore[reportUnknownMemberType]
+        self.logits_net = nn.Sequential(
+            nn.Linear(d_state, d_hidden),
+            activation(),
+            nn.Linear(d_hidden, d_hidden),
+            activation(),
+            nn.Linear(d_hidden, d_action),
         )
 
-    @override
-    def forward(self, state: Tensor) -> Tensor:
-        return self.net(state)  # pyright: ignore[reportAny]
+    def forward(
+        self,
+        states: Tensor,
+        actions: Tensor | None = None,
+    ) -> tuple[Categorical, Tensor | None]:
+        policy = self.policy(states)
+        logp = None
+        if actions is not None:
+            logp = self.logprob(policy, actions)
+        return policy, logp
+
+    def policy(self, states: Tensor) -> Categorical:
+        logits = typing.cast(Tensor, self.logits_net(states))  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+        return Categorical(logits=logits)
+
+    def logprob(self, policy: Categorical, action: Tensor) -> Tensor:
+        action = action.squeeze(-1) if action.dim() > 1 else action
+        return typing.cast(Tensor, policy.log_prob(action))
+
+
+@final
+class Critic(nn.Module):
+    """Value prediction over 1D spaces"""
+
+    def __init__(self, d_state: int, d_hidden: int, activation: nn.Module):
+        super().__init__()  # pyright: ignore[reportUnknownMemberType]
+        self.value_net = nn.Sequential(
+            nn.Linear(d_state, d_hidden),
+            activation(),
+            nn.Linear(d_hidden, d_hidden),
+            activation(),
+            nn.Linear(d_hidden, 1),
+        )
+
+    def forward(self, states: Tensor) -> Tensor:
+        return self.value_net(states).squeeze(-1)
+
+
+@final
+class ActorCritic(nn.Module):
+    def __init__(
+        self,
+        state_space: Box,
+        action_space: Box | Discrete,
+        d_hidden: int = 3,
+        activation: nn.Module = nn.Tanh,  # pyright: ignore[reportArgumentType]
+    ):
+        super().__init__()  # pyright: ignore[reportUnknownMemberType]
+        if isinstance(action_space, Box):
+            self.pi = CategoricalActor(
+                d_state=state_space.shape[0],
+                d_hidden=d_hidden,
+                d_action=action_space.shape[0],
+                activation=activation,
+            )
+        else:
+            self.pi = CategoricalActor(
+                d_state=state_space.shape[0],
+                d_action=int(action_space.n),
+                d_hidden=d_hidden,
+                activation=activation,
+            )
+        self.v = Critic(
+            d_state=state_space.shape[0],
+            d_hidden=d_hidden,
+            activation=activation,
+        )
+
+    def step(self, state: Tensor) -> tuple[int, np.ndarray, float]:
+        with torch.no_grad():
+            policy: Categorical = self.pi.policy(state)
+            action = policy.sample()
+            logp_action = self.pi.logprob(policy, action)  # pyright: ignore[reportArgumentType]
+            v = float(self.v(state))
+            return (int(action), logp_action.numpy(), v)
+
+    def act(self, state: Tensor) -> np.ndarray:
+        with torch.no_grad():
+            return self.pi.policy(state).sample().numpy()
+
+
+@final
+class TrajectoryBuffer:
+    def __init__(
+        self,
+        capacity: int,
+        state_shape: list[int],
+        action_shape: list[int],
+        gamma: float = 0.99,
+        lamda: float = 0.95,
+    ):
+        # env states
+        self.states = np.zeros([capacity, *state_shape], dtype=np.float32)
+        # predicted actions
+        self.actions = np.zeros([capacity, *action_shape], dtype=np.int32)
+        # action advantages
+        self.advantages = np.zeros(capacity, dtype=np.float32)
+        # action rewards
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        # discounted cumulative future rewards for the state
+        self.returns = np.zeros(capacity, dtype=np.float32)
+        # predicted env state values
+        self.values = np.zeros(capacity, dtype=np.float32)
+        # action log probabilities
+        self.logps = np.zeros(capacity, dtype=np.float32)
+        # discount factor
+        self.gamma = gamma
+        # value estimation discount
+        self.lamda = lamda
+        # index for the next insert
+        self.next_index = 0
+        # index for the start of the current episode
+        self.episode_start_index = 0
+        # buffer capacity
+        self.capacity = capacity
+
+    def push(
+        self,
+        state: np.ndarray,
+        action: int,
+        logp: float,
+        value: float,
+        reward: float,
+    ):
+        self.states[self.next_index] = state
+        self.actions[self.next_index] = action
+        self.logps[self.next_index] = logp
+        self.values[self.next_index] = value
+        self.rewards[self.next_index] = reward
+        self.next_index += 1
+
+    def push_episode_end(self, value: float, is_truncated: bool):
+        range = slice(self.episode_start_index, self.next_index)
+        ep_rewards = self.rewards[range]
+        ep_values = self.values[range]
+
+        # TD error
+        bootstrap_value = value if is_truncated else 0.0
+        next_values = np.append(ep_values[1:], bootstrap_value)
+        deltas = ep_rewards + self.gamma * next_values - ep_values
+
+        # GAE-Lambda advantage
+        self.advantages[range] = cumulative_sum(deltas, self.gamma * self.lamda)
+
+        # Return
+        if is_truncated:
+            ep_rewards = np.append(ep_rewards, bootstrap_value)
+            self.returns[range] = cumulative_sum(ep_rewards, self.gamma)[:-1]
+        else:
+            self.returns[range] = cumulative_sum(ep_rewards, self.gamma)
+
+        # Move the episode pointer
+        self.episode_start_index = self.next_index
+
+    def get_batch(self) -> "TrajectoryBatch":
+        """TODO"""
+        assert self.next_index == self.capacity
+        self.next_index = 0
+        self.episode_start_index = 0
+        advantage_mean = np.mean(self.advantages)
+        advantage_std = np.std(self.advantages)
+        self.advantages = (self.advantages - advantage_mean) / advantage_std
+        # print(f"trajectory actions: {self.actions}")
+        return TrajectoryBatch(
+            states=self.states,
+            actions=self.actions,
+            returns=self.returns,
+            advantages=self.advantages,
+            logps=self.logps,
+        )
 
 
 @dataclass
-class PerfTimers:
-    overall: list[float] = field(default_factory=list)
-    step: list[float] = field(default_factory=list)
-    replay: list[float] = field(default_factory=list)
-    eps_greedy_action: list[float] = field(default_factory=list)
+class TrajectoryBatch:
+    states: np.ndarray
+    actions: np.ndarray
+    advantages: np.ndarray
+    logps: np.ndarray
+    returns: np.ndarray
 
-    @override
-    def __repr__(self) -> str:
-        mean_overall = np.mean(self.overall)
-        return "\n".join(
-            [
-                "Perf Timers:",
-                f"- overall: {mean_overall:.4f} sec",
-                f"- step(): {np.mean(self.step) / mean_overall:.2f}",
-                f"- replay(): {np.mean(self.replay) / mean_overall:.2f}",
-                f"- eps_greedy_action(): {np.mean(self.eps_greedy_action) / mean_overall:.2f}",
-            ]
+    def as_torch(self) -> "TrajectoryTorchBatch":
+        return TrajectoryTorchBatch(
+            states=torch.as_tensor(self.states, dtype=torch.float32),
+            actions=torch.as_tensor(self.actions, dtype=torch.long),
+            advantages=torch.as_tensor(self.advantages, dtype=torch.float32),
+            logps=torch.as_tensor(self.logps, dtype=torch.float32),
+            returns=torch.as_tensor(self.returns, dtype=torch.float32),
         )
+
+
+@dataclass
+class TrajectoryTorchBatch:
+    states: Tensor
+    actions: Tensor
+    advantages: Tensor
+    logps: Tensor
+    returns: Tensor
+
+
+@dataclass
+class PolicyInfo:
+    approximate_kl: float
+    mean_entropy: float
+    clipped_fraction: float
+
+
+def count_parameters(module: nn.Module) -> int:
+    """Returns the total number of parameters in a NN module"""
+    return int(sum(np.prod(p.shape) for p in module.parameters()))
+
+
+def cumulative_sum(x: np.ndarray, gamma: float) -> np.ndarray:
+    """
+    Returns the discounted cumulative sum of vector elements
+    Example: cs([1,2,3], 0.95) => [5.59325, 4.835, 3]
+    """
+    result = np.empty_like(x, dtype=np.float32)
+    result[-1] = x[-1]
+    for i in reversed(range(len(x) - 1)):
+        result[i] = x[i] + gamma * result[i + 1]
+    return result
 
 
 if __name__ == "__main__":

@@ -1,7 +1,10 @@
-from .agent import CartPoleAgent
 import gymnasium as gym
 import numpy as np
+import torch
+
 import eval_env
+
+from .agent import CartPoleAgent
 
 
 class CartPoleEvaluator:
@@ -13,23 +16,29 @@ class CartPoleEvaluator:
         self.rendered_env: gym.Env[np.ndarray, int] = gym.make(
             "CartPoleCustom-v0",
             max_episode_steps=5000,
-            render_mode="human",
+            # render_mode="human",
         )
         self.agent = CartPoleAgent()
         self.agent.train()
 
     def select_action(self, state: np.ndarray) -> int:
-        return self.agent.epsilon_greedy_action(state, eps=0, q_net=self.agent.q_net)
+        return int(
+            self.agent.actor_critic.act(
+                torch.as_tensor(state, dtype=torch.float32)
+            ).item()
+        )
 
     def num_parameters(self) -> int:
-        return sum([np.prod(p.shape) for p in self.agent.q_net.parameters()])
+        a = sum([np.prod(p.shape) for p in self.agent.actor_critic.pi.parameters()])
+        c = sum([np.prod(p.shape) for p in self.agent.actor_critic.v.parameters()])
+        return a + c
 
-    def evaluate(self, n_episodes: int = 10):
+    def evaluate(self, n_episodes: int = 100):
         n_parameters = self.num_parameters()
         print(f"agent parameters: {n_parameters}")
         rewards: list[float] = []
         for i in range(n_episodes):
-            env = self.rendered_env  # if i == n_episodes - 1 else self.headless_env
+            env = self.headless_env
             state, _ = env.reset()
             ended = False
             episode_reward = 0.0
@@ -39,6 +48,7 @@ class CartPoleEvaluator:
                 ended = done or terminated
                 episode_reward += float(reward)
             rewards.append(episode_reward)
+            print(f"reward {i:03d}: {episode_reward}")
         r_mean = np.mean(rewards)
         r_std = np.std(rewards)
         print(f"Mean reward: {r_mean} +/- {r_std}")
