@@ -1,15 +1,16 @@
 import gymnasium as gym
 import numpy as np
+import eval_env
 
 
 class CartPoleEvaluator:
     def __init__(self):
         self.headless_env: gym.Env[np.ndarray, int] = gym.make(
-            "CartPole-v1",
+            "CartPoleCustom-v0",
             max_episode_steps=5000,
         )
         self.rendered_env: gym.Env[np.ndarray, int] = gym.make(
-            "CartPole-v1",
+            "CartPoleCustom-v0",
             max_episode_steps=5000,
             render_mode="human",
         )
