@@ -16,7 +16,7 @@ class CartPoleEvaluator:
         self.rendered_env: gym.Env[np.ndarray, int] = gym.make(
             "CartPoleCustom-v0",
             max_episode_steps=5000,
-            # render_mode="human",
+            render_mode="human",
         )
         self.agent = CartPoleAgent()
         self.agent.train()
@@ -33,12 +33,12 @@ class CartPoleEvaluator:
         c = sum([np.prod(p.shape) for p in self.agent.actor_critic.v.parameters()])
         return a + c
 
-    def evaluate(self, n_episodes: int = 100):
+    def evaluate(self, n_episodes: int = 100, render: bool = False):
         n_parameters = self.num_parameters()
         print(f"agent parameters: {n_parameters}")
         rewards: list[float] = []
         for i in range(n_episodes):
-            env = self.headless_env
+            env = self.rendered_env if render else self.headless_env
             state, _ = env.reset()
             ended = False
             episode_reward = 0.0
@@ -60,4 +60,5 @@ class CartPoleEvaluator:
 
 if __name__ == "__main__":
     evaluator = CartPoleEvaluator()
-    evaluator.evaluate()
+    evaluator.evaluate(n_episodes=100, render=False)
+    evaluator.evaluate(n_episodes=1, render=True)
