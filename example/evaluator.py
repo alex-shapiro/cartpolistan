@@ -34,7 +34,7 @@ class CartPoleEvaluator:
         c = sum([np.prod(p.shape) for p in self.agent.actor_critic.v.parameters()])
         return a + c
 
-    def evaluate(self, n_episodes: int = 100, render: bool = False):
+    def evaluate(self, n_episodes: int = 10, render: bool = False):
         n_parameters = self.num_parameters()
         print(f"agent parameters: {n_parameters}")
         rewards: list[float] = []
@@ -61,5 +61,5 @@ class CartPoleEvaluator:
 
 if __name__ == "__main__":
     evaluator = CartPoleEvaluator()
-    evaluator.evaluate(n_episodes=100, render=False)
+    evaluator.evaluate(n_episodes=10, render=False)
     evaluator.evaluate(n_episodes=1, render=True)
